@@ -79,13 +79,7 @@ async function findUserIdByCustomerId(customerId) {
   return q.empty ? null : q.docs[0].id;
 }
 
-// // ---------- Your price mapping (lookup_key -> price id) ----------
-// const PRICE_BY_LOOKUP = {
-//   Price_id:  'price_1S1XnoASIXMKONrY5tVB5H5s',
-//   Price_id2: 'price_1S1YREASIXMKONrYNXhVOmY0',
-//   Price_id3: 'price_1S1YU2ASIXMKONrYQepXy4iI',
-//   Price_id4: 'price_1S1YXuASIXMKONrY8aCRVSlI',
-// };
+
 
 // ---------- Your price mapping (lookup_key -> price id) ----------
 const PRICE_BY_LOOKUP = {
@@ -377,121 +371,6 @@ console.log(agentdata);
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// ---------- Create Checkout Session (subscription) ----------
-// app.post('/billing/checkout', async (req, res) => {
-//   try {
-//     const {   product_id, user_id, email  ,lookup_key ,lookupKey  } = req.body || {};
-
-//     const priceId = await resolvePriceId({ lookupKey, product_id });
-
-//     console.log(priceId);
-    
-//     const matchBy = product_id ? 'product' : 'price'; // prefer matching by product if provided
-
-//     // Reuse or create Customer (optional but recommended)
-//     let customerId;
-//     if (email) {
-//       const existing = await stripe.customers.list({ email, limit: 1 });
-//       console.log(existing);
-      
-//       if (existing.data[0]) {
-//         customerId = existing.data[0].id;
-//       } else {
-//         const created = await stripe.customers.create({ email, metadata: { user_id: user_id || '' } });
-//         customerId = created.id;
-//       }
-//     }
-
-   
-
-//      const subs = await stripe.subscriptions.list({
-//       customer: customerId,
-//       status: 'all',
-//       // expand: ['data.items.data.price.product'],
-//       expand: ['data.items.data.price', 'data.latest_invoice.payment_intent', 'data.default_payment_method'],
-//       limit: 100,
-//     });
-// console.log(subs);
-
-//     const ACTIVE_STATES = new Set(['active', 'trialing', 'past_due', 'unpaid']);
-
-//     const sameSub = subs.data.find((sub) => {
-//       if (!ACTIVE_STATES.has(sub.status)) return false;
-//       return sub.items.data.some((it) => {
-//         if (matchBy === 'product') {
-//           const prod =
-//             typeof it.price.product === 'string'
-//               ? it.price.product
-//               : it.price.product && it.price.product.id;
-//         return product_id && prod === product_id;
-//         }
-//         return it.price && it.price.id === priceId; // match by price (default)
-//       });
-//     });
-
-//     if (sameSub) {
-//       // Send to Billing Portal to manage the existing subscription
-//       const portal = await stripe.billingPortal.sessions.create({
-//         customer: customerId,
-//         return_url: `${APP_URL}/dashboard/billing`,
-//       });
-//       return res.status(409).json({
-//         error: 'duplicate_subscription',
-//         message: 'You already have an active subscription for this plan.',
-//         subscriptionId: sameSub.id,
-//         portalUrl: portal.url,
-//       });
-//     }
-
-         
-    
-
-//     const session = await stripe.checkout.sessions.create({
-//       mode: 'subscription',
-//       line_items: [{ price: priceId, quantity: 1 }],
-//       ...(customerId ? { customer: customerId } : { customer_email: email }),
-//       allow_promotion_codes: true,
-//       client_reference_id: user_id || undefined,
-//       success_url: `${APP_URL}/dashboard/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-//       cancel_url: `${APP_URL}/billing/cancelled`,
-//       subscription_data: {
-//         metadata: {
-//           user_id: user_id || '',
-//           // product_key: product_key || '',
-//           lookup_key: lookup_key || '',
-//           product_id: product_id || ''
-//         }
-//       },
-//       metadata: {
-//         user_id: user_id || '',
-//         // product_key: product_key || '',
-//         lookup_key: lookup_key || '',
-//         product_id: product_id || ''
-//       }
-//       // automatic_tax: { enabled: true },
-//     });
-
-//  const user =   await patchUser(user_id, {
-//       plan:  product_id|| 'unknown',
-//       billing: {
-//         status: 'pending',
-//         lastPaymentStatus: 'unpaid',
-//         stripeCustomerId: customerId || null,
-//         stripeSubscriptionId: null,
-//         checkoutSessionId: session.id,   // correlate later
-//         priceId,
-//         lookupKey: lookup_key || null,
-//         productId: product_id || null,
-//         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-//       },
-//     });
-//     // console.log("user", user);
-//     return res.json({ url: session.url });
-//   } catch (err) {
-//     console.error('❌ Checkout error:', err.message);
-//     return res.status(400).json({ error: err.message || 'Checkout create failed' });
-//   }
-// });
 
 app.post('/billing/checkout',verifyFirebaseToken, async (req, res) => {
   const user_id= req.uid
@@ -684,30 +563,7 @@ console.log("tt",updated.items.data[0].price.lookup_key );
   }
 });
 
-// ---------- Billing Portal ----------
-// app.post('/billing/portal', async (req, res) => {
-//   try {
-//     let { customer_id ,email } = req.body || {};
-//     if (!customer_id) return res.status(400).json({ error: 'customer_id required' });
-//       let customerId = null;
-//     if (email) {
-//       const existing = await stripe.customers.list({ email, limit: 1 });
-//       customerId = existing.data[0]?.id || (await stripe.customers.create({ email, metadata: { user_id: user_id || '' } })).id;
-//     }
-//     if (!customerId) return res.status(400).json({ error: 'customer_not_found', message: 'Provide email or known customer id.' });
 
-
-//     const portal = await stripe.billingPortal.sessions.create({
-//       customer: customerId,
-//       return_url: `${APP_URL}/dashboard/billing`
-//     });
-
-//     res.json({ url: portal.url });
-//   } catch (err) {
-//     console.error('❌ Portal error:', err.message);
-//     res.status(400).json({ error: err.message || 'Portal failed' });
-//   }
-// });
 app.post('/billing/portal', async (req, res) => {
   try {
     const { customer_id, user_id, email } = req.body || {};
@@ -831,29 +687,7 @@ const TotalCredit= u.creditsToAdd
        
     };
 
-    // Only enrich from Stripe if the client explicitly asks for it
-    // if (expand =="stripe" && u.priceId) {
 
-      // const price = await stripe.prices.retrieve(u.plan_lookup_key, { expand: ["product"] });
-      // console.log("price",price);
-      // const productObj = typeof price.product === "object" ? price.product : null;
-
-      // payload.subscription.stripe = {
-      //   price: {
-      //     id: price.id,
-      //     nickname: price.nickname || null,          // UI label candidate (not hardcoded)
-      //     unitAmount: price.unit_amount,             // cents
-      //     currency: price.currency,                  // e.g. "usd"
-      //     type: price.type,                          // "recurring" | "one_time"
-      //     recurring: price.recurring || null,        // { interval, interval_count, ... }
-      //   },
-      //   product: {
-      //     id: typeof price.product === "string" ? price.product : productObj?.id || null,
-      //     name: productObj?.name || null,            // UI label candidate (not hardcoded)
-      //   },
-      // };
-    // }
-//  console.log(payload);
 const sub = await stripe.subscriptions.retrieve( u.billing.stripeSubscriptionId, {
   expand: ["items.data.price.product"],
 });
@@ -1021,6 +855,8 @@ app.use(
     optionsSuccessStatus: 200,
   }),
 );
+app.use(cors({ origin: true, credentials: true }));
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
