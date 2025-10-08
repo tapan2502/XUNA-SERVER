@@ -35,6 +35,39 @@ const APP_URL = process.env.APP_URL || 'http://localhost:5173';
 
 const app = express();
 
+// put this RIGHT AFTER `const app = express();`
+app.use((req, res, next) => {
+  console.log('>>>', req.method, req.originalUrl, 'Origin:', req.headers.origin);
+  next();
+});
+
+function setCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  // allow specific origins; do NOT echo empty string
+  if (origin && isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+
+  const reqHeaders = req.headers['access-control-request-headers'];
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    reqHeaders || 'Authorization, Content-Type, X-Requested-With, Accept, Origin'
+  );
+  // Optional but helpful for browsers:
+  res.setHeader('Access-Control-Expose-Headers', 'Location, Link, Content-Length');
+}
+
+// 1) CORS + preflight first
+app.use((req, res, next) => {
+  setCorsHeaders(req, res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  next();
+});
+
+
 const envAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS
   ? process.env.CORS_ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
   : [];
