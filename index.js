@@ -68,18 +68,17 @@ app.use((req, res, next) => {
 });
 
 
-const envAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS
-  ? process.env.CORS_ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
-  : [];
-
 const staticAllowedOrigins = [
   "http://localhost:5173",
+  "http://localhost:5174",
   "http://127.0.0.1:5173",
+  "http://127.0.0.1:5174",
   "https://xuna-client.vercel.app",
+  "https://xuna-client.vercel.app/",
   process.env.APP_URL,
 ].filter(Boolean);
 
-const allowedOrigins = [...new Set([...staticAllowedOrigins, ...envAllowedOrigins])];
+const allowedOrigins = [...new Set(staticAllowedOrigins)];
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
