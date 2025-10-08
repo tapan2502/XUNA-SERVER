@@ -1,6 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import expressWs from "express-ws";
+import cors from "cors";
 import agentRoutes from "./src/routes/agent.js";
 import phoneNumberRoutes from "./src/routes/phoneNumber.js";
 import voiceRoutes from "./src/routes/voice.js";
@@ -77,39 +78,38 @@ const staticAllowedOrigins = [
   process.env.APP_URL,
 ].filter(Boolean);
 
-const allowedOrigins = [...new Set(staticAllowedOrigins)];
+const allowedOrigins = new Set(staticAllowedOrigins);
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
-  if (allowedOrigins.includes(origin)) return true;
+  if (allowedOrigins.has(origin)) return true;
   if (origin.endsWith(".vercel.app")) return true;
+  console.warn(`CORS rejected origin: ${origin}`);
   return false;
 };
-
-const setCorsHeaders = (req, res) => {
-  const origin = req.headers.origin || "";
-  if (isAllowedOrigin(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-  );
-  const requestHeaders =
-    req.headers["access-control-request-headers"] ||
-    "Authorization, Content-Type, X-Requested-With, Accept, Origin";
-  res.setHeader("Access-Control-Allow-Headers", requestHeaders);
-};
-
-app.use((req, res, next) => {
-  setCorsHeaders(req, res);
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  next();
+const corsMiddleware = cors({
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Authorization",
+    "Content-Type",
+    "X-Requested-With",
+    "Accept",
+    "Origin",
+    "x-impersonate-user",
+  ],
+  exposedHeaders: ["Content-Length"],
+  optionsSuccessStatus: 200,
 });
+
+app.use(corsMiddleware);
+app.options("*", corsMiddleware);
 
 app.use((req, _, next) => {
   if (req.url.includes("//")) {
