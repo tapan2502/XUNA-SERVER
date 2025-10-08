@@ -74,7 +74,6 @@ const staticAllowedOrigins = [
   "http://127.0.0.1:5173",
   "http://127.0.0.1:5174",
   "https://xuna-client.vercel.app",
-  "https://xuna-client.vercel.app/",
   process.env.APP_URL,
 ].filter(Boolean);
 
