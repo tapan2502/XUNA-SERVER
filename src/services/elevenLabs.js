@@ -7,7 +7,11 @@ const ELEVEN_LABS_API_URL = "https://api.elevenlabs.io/v1/convai/agents";
 const API_KEY = process.env.ELEVEN_LABS_API_KEY;
 
 export const elevenLabsService = {
-  async createAgent(name, config) {
+  async createAgent(name, config, params = {}) {
+    const filteredParams = Object.fromEntries(
+      Object.entries(params).filter(([, value]) => value !== undefined)
+    );
+
     try {
       const response = await axios.post(
         `${ELEVEN_LABS_API_URL}/create`,
@@ -20,11 +24,16 @@ export const elevenLabsService = {
             "xi-api-key": API_KEY,
             "Content-Type": "application/json",
           },
+          params: filteredParams,
         },
       );
       return response.data;
     } catch (error) {
-      throw new Error(`Failed to create agent: ${error.message}`);
+      const details =
+        error.response?.data ||
+        error.response?.statusText ||
+        error.message;
+      throw new Error(`Failed to create agent: ${JSON.stringify(details)}`);
     }
   },
 

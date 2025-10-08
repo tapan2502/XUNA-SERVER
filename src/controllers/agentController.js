@@ -22,11 +22,13 @@ export const agentController = {
 
       const user_id = req.uid;
       const { conversation_config, name } = req.body;
+      const { use_tool_ids } = req.query;
 
       // Create agent in Eleven Labs
       const elevenLabsAgent = await elevenLabsService.createAgent(
         name,
-        conversation_config
+        conversation_config,
+        { use_tool_ids }
       );
 
       console.log("elevenLabsAgent", elevenLabsAgent);
