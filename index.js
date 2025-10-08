@@ -1,6 +1,5 @@
 import express from "express";
 import dotenv from "dotenv";
-import cors from "cors";
 import expressWs from "express-ws";
 import agentRoutes from "./src/routes/agent.js";
 import phoneNumberRoutes from "./src/routes/phoneNumber.js";
@@ -56,21 +55,30 @@ const isAllowedOrigin = (origin) => {
   return false;
 };
 
-const corsOptions = {
-  origin(origin, callback) {
-    if (isAllowedOrigin(origin)) {
-      return callback(null, true);
-    }
-    console.warn(`Blocked by CORS: ${origin}`);
-    return callback(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  optionsSuccessStatus: 200,
+const setCorsHeaders = (req, res) => {
+  const origin = req.headers.origin || "";
+  if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+  );
+  const requestHeaders =
+    req.headers["access-control-request-headers"] ||
+    "Authorization, Content-Type, X-Requested-With, Accept, Origin";
+  res.setHeader("Access-Control-Allow-Headers", requestHeaders);
 };
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.use((req, res, next) => {
+  setCorsHeaders(req, res);
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+  next();
+});
 
 app.use((req, _, next) => {
   if (req.url.includes("//")) {
