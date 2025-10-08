@@ -66,19 +66,20 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Requested-With",
-    "Accept",
-    "Origin",
-  ],
-  exposedHeaders: ["Content-Length"],
   optionsSuccessStatus: 200,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
+app.use((req, _, next) => {
+  if (req.url.includes("//")) {
+    const [path, ...rest] = req.url.split("?");
+    const normalizedPath = path.replace(/\/{2,}/g, "/");
+    req.url = rest.length ? `${normalizedPath}?${rest.join("?")}` : normalizedPath;
+  }
+  next();
+});
 
 // // const patchUser = async (userId, patch) => userId && db.collection('users').doc(userId).set(patch, { merge: true });
 
