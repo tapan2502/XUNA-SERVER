@@ -67,6 +67,9 @@ export const phoneNumberController = {
       res.status(201).json(elevenLabsPhoneNumber);
     } catch (error) {
       console.error("Error creating phone number:", error);
+      if (error.response) {
+        return res.status(error.response.status).json(error.response.data);
+      }
       res.status(500).json({ error: "Failed to create phone number" });
     }
   },
@@ -245,19 +248,19 @@ export const phoneNumberController = {
         );
         return storedPhoneNumber
           ? {
-              ...phoneNumber,
-              label: storedPhoneNumber.label,
-              ...(storedPhoneNumber.sid && { sid: storedPhoneNumber.sid }),
-              ...(storedPhoneNumber.token && {
-                token: storedPhoneNumber.token,
-              }),
-              ...(storedPhoneNumber.credentials && {
-                credentials: storedPhoneNumber.credentials,
-              }),
-              ...(storedPhoneNumber.address && {
-                address: storedPhoneNumber.address,
-              }),
-            }
+            ...phoneNumber,
+            label: storedPhoneNumber.label,
+            ...(storedPhoneNumber.sid && { sid: storedPhoneNumber.sid }),
+            ...(storedPhoneNumber.token && {
+              token: storedPhoneNumber.token,
+            }),
+            ...(storedPhoneNumber.credentials && {
+              credentials: storedPhoneNumber.credentials,
+            }),
+            ...(storedPhoneNumber.address && {
+              address: storedPhoneNumber.address,
+            }),
+          }
           : phoneNumber;
       });
 
