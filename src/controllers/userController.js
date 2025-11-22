@@ -11,7 +11,7 @@ export const userController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const {  targetUserId } = value;
+      const { targetUserId } = value;
       const currentUserId = req.uid;
       if (!currentUserId) {
         return res.status(401).json({ error: 'Unauthorized: No user ID found in request' });
@@ -19,17 +19,17 @@ export const userController = {
 
       // First, verify that the current user is a super-admin
       const currentUserDoc = await db.collection('users').doc(currentUserId).get();
-      
+
       if (!currentUserDoc.exists) {
         return res.status(404).json({ error: 'Current user not found' });
       }
 
       const currentUserData = currentUserDoc.data();
-      
+
       // Check if the current user has super-admin role
       if (currentUserData.role !== 'super-admin') {
-        return res.status(403).json({ 
-          error: 'Access denied. Only super-admin users can delete other users.' 
+        return res.status(403).json({
+          error: 'Access denied. Only super-admin users can delete other users.'
         });
       }
 
@@ -50,7 +50,7 @@ export const userController = {
       // 2. Remove target user from current user's sentRequests
       const newSentRequests = { ...currentUserData.sentRequests };
       delete newSentRequests[targetUserId];
-      
+
       batch.update(db.collection('users').doc(currentUserId), {
         sentRequests: newSentRequests,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -58,10 +58,10 @@ export const userController = {
 
       // 3. Get all users to clean up references
       const allUsersSnapshot = await db.collection('users').get();
-      
+
       allUsersSnapshot.docs.forEach(userDoc => {
         if (userDoc.id === targetUserId || userDoc.id === currentUserId) return;
-        
+
         const userData = userDoc.data();
         let needsUpdate = false;
         const updates = {};
@@ -100,18 +100,71 @@ export const userController = {
         // Continue - Firestore deletion was successful
       }
 
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: `User ${targetUserData.email} has been successfully deleted`,
-        deletedUserId: targetUserId 
+        deletedUserId: targetUserId
       });
 
     } catch (error) {
       console.error('Error deleting user:', error);
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'Internal server error',
-        details: error.message 
+        details: error.message
       });
+    }
+  },
+  async getUserDetails(req, res) {
+    try {
+      const userId = req.uid;
+      if (!userId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      const userDoc = await db.collection('users').doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const userData = userDoc.data();
+      // Return relevant user details
+      res.json({
+        uid: userId,
+        email: userData.email,
+        name: userData.name || null,
+        role: userData.role || 'user',
+        photoURL: userData.photoURL || null,
+        createdAt: userData.createdAt,
+        batch_calls: userData.batch_calls || [],
+        // Add other fields as needed
+      });
+    } catch (error) {
+      console.error('Error fetching user details:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+
+  async changePassword(req, res) {
+    try {
+      const { password } = req.body;
+      const userId = req.uid;
+
+      if (!userId) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      if (!password || password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+      }
+
+      await admin.auth().updateUser(userId, {
+        password: password,
+      });
+
+      res.json({ success: true, message: 'Password updated successfully' });
+    } catch (error) {
+      console.error('Error updating password:', error);
+      res.status(500).json({ error: 'Failed to update password', details: error.message });
     }
   }
 };
