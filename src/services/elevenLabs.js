@@ -55,7 +55,12 @@ export const elevenLabsService = {
       );
       return response.data;
     } catch (error) {
-      throw new Error(`Failed to update agent: ${error.message}`);
+      const details =
+        error.response?.data ||
+        error.response?.statusText ||
+        error.message;
+      console.error("ElevenLabs update error details:", JSON.stringify(details, null, 2));
+      throw new Error(`Failed to update agent: ${JSON.stringify(details)}`);
     }
   },
 
