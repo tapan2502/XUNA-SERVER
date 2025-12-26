@@ -4,7 +4,7 @@ import { verifyFirebaseToken } from "../middlewares/verifyFirebaseToken.js";
 
 const router = express.Router();
 
-router.post("/create",verifyFirebaseToken ,agentController.createAgent);
+router.post("/create", verifyFirebaseToken, agentController.createAgent);
 router.patch(
   "/:agent_id",
   verifyFirebaseToken,
@@ -14,6 +14,11 @@ router.delete(
   "/:agent_id",
   verifyFirebaseToken,
   agentController.deleteAgent
+);
+router.patch(
+  "/:agent_id/status",
+  verifyFirebaseToken,
+  agentController.updateAgentStatus
 );
 router.get(
   "/:agent_id",

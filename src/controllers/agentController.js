@@ -8,6 +8,24 @@ import {
   listAgentsSchema,
 } from "../validators/agent.js";
 import admin from "firebase-admin";
+import { elevenLabsPhoneNumberService } from "../services/elevenLabsPhoneNumber.js";
+import { elevenLabsConversationService } from "../services/elevenLabsConversation.js";
+
+const formatModelName = (modelId) => {
+  if (!modelId) return "ChatGPT 4o";
+  const map = {
+    "gpt-3.5-turbo": "GPT 3.5 Turbo",
+    "gpt-4": "GPT 4",
+    "gpt-4o": "GPT 4o",
+    "gpt-4o-mini": "GPT 4o Mini",
+    "claude-3-opus": "Claude 3 Opus",
+    "claude-3-sonnet": "Claude 3 Sonnet",
+    "claude-3-haiku": "Claude 3 Haiku",
+    "gemini-1.5-pro": "Gemini 1.5 Pro",
+    "gemini-1.5-flash": "Gemini 1.5 Flash",
+  };
+  return map[modelId] || modelId.split("-").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+};
 
 export const agentController = {
   async createAgent(req, res) {
@@ -32,7 +50,7 @@ export const agentController = {
       );
 
       console.log("elevenLabsAgent", elevenLabsAgent);
-      
+
 
       // Store agent reference in Firebase
       const userRef = db.collection("users").doc(user_id);
@@ -178,16 +196,44 @@ export const agentController = {
     }
   },
 
-  async listAgents(req, res) {
+  async updateAgentStatus(req, res) {
     try {
-      const { error, value } = listAgentsSchema.validate(req.body);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
+      const user_id = req.uid;
+      const { agent_id } = req.params;
+      const { status } = req.body;
+
+      if (!status || !["active", "inactive"].includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
       }
 
+      const userDoc = await db.collection("users").doc(user_id).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const userData = userDoc.data();
+      const agents = userData.agents || [];
+      const agentIndex = agents.findIndex((a) => a.agent_id === agent_id);
+
+      if (agentIndex === -1) {
+        return res.status(404).json({ error: "Agent not found" });
+      }
+
+      agents[agentIndex].status = status;
+      await userDoc.ref.update({ agents });
+
+      res.json({ message: "Status updated", status });
+    } catch (error) {
+      console.error("Error updating agent status:", error);
+      res.status(500).json({ error: "Failed to update status" });
+    }
+  },
+
+  async listAgents(req, res) {
+    try {
       const user_id = req.uid;
 
-      // Get user's agents from Firebase
+      // 1. Get user agents & usage limits from Firebase
       const userDoc = await db.collection("users").doc(user_id).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
@@ -195,32 +241,61 @@ export const agentController = {
 
       const userData = userDoc.data();
       const userAgents = userData.agents || [];
+      const usageLimit = userData.usage_limit || 6000; // Default: 100 minutes (6000 seconds)
 
-      // Get all agents from Eleven Labs
-      const { agents, has_more, next_cursor } =
-        await elevenLabsService.listAgents();
+      if (userAgents.length === 0) {
+        return res.json({ agents: [], has_more: false });
+      }
 
-      // Filter agents to only include those belonging to the user
-      const userAgentIds = new Set(userAgents.map((agent) => agent.agent_id));
-      const filteredAgents = agents.filter((agent) =>
-        userAgentIds.has(agent.agent_id)
+      // 2. Fetch Phone Numbers (for binding info)
+      const phoneNumbersList = await elevenLabsPhoneNumberService.listPhoneNumbers();
+
+      // 3. Enrich each agent concurrently
+      const enrichedAgents = await Promise.all(
+        userAgents.map(async (ua) => {
+          try {
+            // A. Get full details (Model, Language, Phone Numbers)
+            const details = await elevenLabsService.getAgent(ua.agent_id);
+
+            // B. Extract phone number from agent details
+            const phoneNumber = details.phone_numbers && details.phone_numbers.length > 0
+              ? details.phone_numbers[0].phone_number
+              : null;
+
+            // C. Calculate Usage from Conversation History
+            const conversationsResponse =
+              await elevenLabsConversationService.listConversations(
+                ua.agent_id
+              );
+            const conversations = conversationsResponse.conversations || [];
+            const totalDurationSecs = conversations.reduce(
+              (sum, conv) => sum + (conv.call_duration_secs || 0),
+              0
+            );
+
+            return {
+              ...details,
+              status: ua.status || "inactive",
+              phoneNumber,
+              usage: Math.round(totalDurationSecs / 60),
+              usageMax: Math.round(usageLimit / 60),
+              language: details.conversation_config?.agent?.language || "en",
+              languageName: details.conversation_config?.agent?.language === "en" ? "English" : (details.conversation_config?.agent?.language || "English"),
+              modelName: formatModelName(details.conversation_config?.agent?.prompt?.llm),
+            };
+          } catch (err) {
+            console.error(`Error enriching agent ${ua.agent_id}:`, err.message);
+            return {
+              agent_id: ua.agent_id,
+              name: "Error loading",
+              status: ua.status || "inactive",
+            };
+          }
+        })
       );
-
-      // Merge additional user data (like custom names) with Eleven Labs data
-      const enrichedAgents = filteredAgents.map((agent) => {
-        const userAgent = userAgents.find(
-          (ua) => ua.agent_id === agent.agent_id
-        );
-        return {
-          ...agent,
-          name: agent.name,
-        };
-      });
 
       res.json({
         agents: enrichedAgents,
-        has_more,
-        next_cursor,
       });
     } catch (error) {
       console.error("Error listing agents:", error);
