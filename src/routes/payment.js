@@ -5,7 +5,7 @@ import { verifyFirebaseToken } from "../middlewares/verifyFirebaseToken.js";
 const router = express.Router();
 
 // Customer management
-router.post("/create-customer", verifyFirebaseToken,paymentController.createCustomer);
+router.post("/create-customer", verifyFirebaseToken, paymentController.createCustomer);
 
 // Subscription management
 router.post(
@@ -51,7 +51,7 @@ router.get(
   paymentController.getUserBalanceAndUsage
 );
 
-router.get(
+router.post(
   "/invoice-payment",
   verifyFirebaseToken,
   paymentController.invoicePayment

@@ -28,7 +28,7 @@ import admin from "firebase-admin";
 dotenv.config();
 
 import Stripe from "stripe";
-import { secondsToMinutesUpper}  from "./src/constant/secondsToMinutesUpper.js";
+import { secondsToMinutesUpper } from "./src/constant/secondsToMinutesUpper.js";
 import billingrouter from "./src/routes/billinginvoice.js";
 import { verifyFirebaseToken } from "./src/middlewares/verifyFirebaseToken.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -40,6 +40,156 @@ const app = express();
 app.use((req, res, next) => {
   console.log('>>>', req.method, req.originalUrl, 'Origin:', req.headers.origin);
   next();
+});
+
+// ---------- STRIPE WEBHOOK (Critical: Must be before express.json) ----------
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  console.log("🔔 [Stripe Webhook] Received request at /stripe/webhook");
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+  } catch (err) {
+    console.error(`❌ [Stripe Webhook] Signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  console.log("✅ [Stripe Webhook] Event verified:", event.type);
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        console.log("📦 [Stripe Webhook] Session Metadata:", JSON.stringify(session.metadata, null, 2));
+
+        const userId = session.metadata?.userId || session.metadata?.user_id || '';
+
+        if (session.metadata?.type === "topup") {
+          const amount = session.amount_total / 100;
+          console.log(`💰 [Stripe Webhook] Processing top-up: $${amount} for user: ${userId}`);
+
+          try {
+            const userRef = db.collection("users").doc(userId);
+            const userDoc = await userRef.get();
+
+            if (!userDoc.exists) {
+              console.error(`❌ [Stripe Webhook] User ${userId} not found in Firestore`);
+              return res.json({ received: true });
+            }
+
+            const userData = userDoc.data();
+            const currentBalance = userData.creditsToAdd || 0;
+
+            await userRef.set({
+              creditsToAdd: currentBalance + (amount * 4),
+              hasToppedUp: true,
+              lastTopUpAt: new Date().toISOString(),
+            }, { merge: true });
+
+            await userRef.collection("invoices").add({
+              totalCost: amount * 100,
+              invoiceStatus: "paid",
+              paidAt: new Date().toISOString(),
+              description: `Credits Top-up ($${amount})`,
+              type: "topup",
+              stripeUrl: session.url
+            });
+
+            console.log(`✅ [Stripe Webhook] Top-up successful for ${userId}`);
+          } catch (err) {
+            console.error("🔥 [Stripe Webhook] Firestore error:", err.message);
+          }
+        }
+
+        if (userId && session.subscription) {
+          const sub = await stripe.subscriptions.retrieve(session.subscription, { expand: ['items.data.price'] });
+          await writeBillingFromSubscription(userId, sub, { sessionPaymentStatus: session.payment_status || null });
+        }
+        break;
+      }
+
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+        const userId = sub.metadata?.userId || sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
+        if (userId) await writeBillingFromSubscription(userId, sub);
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+        const userId = sub.metadata?.userId || sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
+        if (userId) {
+          await patchUser(userId, {
+            plan_lookup_key: null,
+            plan: null,
+            currentPlan: null,
+            entitlements: { agents: 0, monthlyCreditsIncluded: 0, addonSeatQty: 0 },
+            billing: {
+              status: sub.status || 'canceled',
+              lastPaymentStatus: 'unpaid',
+              stripeCustomerId: custId || null,
+              stripeSubId: sub.id,
+              currentPeriodEnd: sub.current_period_end ?? null,
+              cancelAtPeriodEnd: !!sub.cancel_at_period_end,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          });
+        }
+        break;
+      }
+
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        if (!invoice.subscription) break;
+
+        const sub = await stripe.subscriptions.retrieve(invoice.subscription, { expand: ['items.data.price'] });
+        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+        const userId = sub.metadata?.userId || sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
+
+        if (userId) {
+          const item = sub.items.data[0];
+          const key = item.price.lookup_key;
+          const amountUsd = ((item.plan.amount || 0) / 100) * 4;
+          const agentdata = requirePlanInfo(key);
+
+          await patchUser(userId, {
+            entitlements: agentdata,
+            plan_lookup_key: key || null,
+            billing: {
+              status: sub.status,
+              lastPaymentStatus: 'paid',
+              stripeCustomerId: custId || null,
+              stripeSubId: sub.id,
+              currentPeriodEnd: sub.current_period_end ?? null,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          });
+
+          await db.collection("users").doc(userId).collection("invoices").doc(invoice.id).set({
+            totalCost: invoice.amount_paid || 0,
+            invoiceStatus: "paid",
+            paidAt: new Date().toISOString(),
+            description: invoice.number || "Monthly Subscription",
+            type: "subscription",
+            stripeUrl: invoice.hosted_invoice_url || null
+          }, { merge: true });
+
+          await db.collection('users').doc(userId).set({
+            creditsToAdd: admin.firestore.FieldValue.increment(amountUsd),
+            balanceUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+        }
+        break;
+      }
+    }
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("🔥 [Stripe Webhook] Handler error:", err.message);
+    return res.status(500).send("Internal Server Error");
+  }
 });
 
 function setCorsHeaders(req, res) {
@@ -122,8 +272,8 @@ app.use((req, _, next) => {
 
 // // const patchUser = async (userId, patch) => userId && db.collection('users').doc(userId).set(patch, { merge: true });
 
- 
- 
+
+
 // // ---------- Helpers ----------
 async function resolvePriceId({ lookup_key, product_id }) {
   if (lookup_key && PRICE_BY_LOOKUP[lookup_key]) return PRICE_BY_LOOKUP[lookup_key];
@@ -139,7 +289,7 @@ async function resolvePriceId({ lookup_key, product_id }) {
   throw new Error('No lookup_key or product_id provided');
 }
 
- //--- Small utils ----------
+//--- Small utils ----------
 function cleanUndefined(obj) {
   if (Array.isArray(obj)) return obj.map(cleanUndefined);
   if (obj && typeof obj === 'object') {
@@ -159,15 +309,19 @@ async function patchUser(userId, patch) {
 }
 
 async function findUserIdByCustomerId(customerId) {
-  const q = await db.collection('users').where('billing.stripeCustomerId', '==', customerId).limit(1).get();
-  return q.empty ? null : q.docs[0].id;
+  // Check both the root and the billing object
+  const q1 = await db.collection('users').where('billing.stripeCustomerId', '==', customerId).limit(1).get();
+  if (!q1.empty) return q1.docs[0].id;
+
+  const q2 = await db.collection('users').where('stripeCustomerId', '==', customerId).limit(1).get();
+  return q2.empty ? null : q2.docs[0].id;
 }
 
 
 
 // ---------- Your price mapping (lookup_key -> price id) ----------
 const PRICE_BY_LOOKUP = {
-  Price_id:  'price_1S47vLASIXMKONrYGOiUQu80',
+  Price_id: 'price_1S47vLASIXMKONrYGOiUQu80',
   Price_id2: 'price_1S4DvcASIXMKONrYb59Fh8Cg',
   Price_id3: 'price_1S47vOASIXMKONrYisFtZ6IP',
   Price_id4: 'price_1S47vVASIXMKONrY8Zd6BWVX',
@@ -177,10 +331,10 @@ const PRICE_BY_LOOKUP = {
 // ---------- Entitlements / plan names ----------
 const BASE_BY_LOOKUP = {
   //   lookup_key                planKey                  plain name                 agents  credits
-  Price_id:   { planKey: 'starter',            name: 'Starter',            agentsIncluded: 3,   monthlyCredits: 3000 },
-  Price_id2:  { planKey: 'growth',             name: 'Growth',             agentsIncluded: 10,  monthlyCredits: 12000 },
-  Price_id3:  { planKey: 'pro',                name: 'Pro',                agentsIncluded: 25,  monthlyCredits: 40000 },
-  Price_id4:  { planKey: 'agency_white_label', name: 'Agency White Label', agentsIncluded: 100, monthlyCredits: 200000 },
+  Price_id: { planKey: 'starter', name: 'Starter', agentsIncluded: 3, monthlyCredits: 3000 },
+  Price_id2: { planKey: 'growth', name: 'Growth', agentsIncluded: 10, monthlyCredits: 12000 },
+  Price_id3: { planKey: 'pro', name: 'Pro', agentsIncluded: 25, monthlyCredits: 40000 },
+  Price_id4: { planKey: 'agency_white_label', name: 'Agency White Label', agentsIncluded: 100, monthlyCredits: 200000 },
 };
 const ADDON_AGENT_LOOKUP = 'nv_voice_addon_agent_v1';
 const ADDON_CREDITS_PER_SEAT = 1000;
@@ -216,7 +370,7 @@ function summarizeEntitlementsFromSub(sub) {
   const baseLookup = baseItem?.price?.lookup_key || null;
   const base = baseLookup ? BASE_BY_LOOKUP[baseLookup] : null;
   console.log(base);
-  
+
 
   let addonSeats = 0;
   for (const it of items) {
@@ -243,15 +397,15 @@ function summarizeEntitlementsFromSub(sub) {
 async function writeBillingFromSubscription(userId, sub, opts = {}) {
   const { sessionPaymentStatus = null } = opts;
   const { planLookupKey, planKey, planName, entitlements } = summarizeEntitlementsFromSub(sub);
-console.log(planLookupKey, planKey, planName, entitlements );
-const agentdata =requirePlanInfo(planLookupKey)
- let creditsToAdd = 0;
+  console.log(planLookupKey, planKey, planName, entitlements);
+  const agentdata = requirePlanInfo(planLookupKey)
+  let creditsToAdd = 0;
   await patchUser(userId, {
     // creditsToAdd: (creditsToAdd+sub.items.data[0].plan.amount/100 || 0)*4,
     plan_lookup_key: planLookupKey || null,
     plan: planKey || null,          // keep if you still use this internally
     currentPlan: planName || null,  // 👈 plain name for UI
-    entitlements:agentdata,
+    entitlements: agentdata,
     billing: {
       status: sub?.status || (sessionPaymentStatus === 'paid' ? 'active' : 'pending'),
       lastPaymentStatus: sessionPaymentStatus ?? null,
@@ -264,201 +418,22 @@ const agentdata =requirePlanInfo(planLookupKey)
   });
 }
 
-// ---------- STRIPE WEBHOOK (must be BEFORE express.json) ----------
-app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  console.log("vv",event.type);
-  
-  try {
-    switch (event.type) {
-      // First-time completion after hosted checkout
-      case 'checkout.session.completed': {
-        const session = event.data.object;
-        console.log(session);
-        
-        const userId = session.metadata?.user_id || '';
-      console.log(session.metadata?.type === "topup");
-      
-        if (session.metadata?.type === "topup") {
-        const userId = session.metadata.userId;
-        const amount = session.amount_total / 100;
-
-        try {
-          const userRef = db.collection("users").doc(userId);
-          const userDoc = await userRef.get();
-          const currentBalance = userDoc.exists
-            ? userDoc.data().creditsToAdd || 0
-            : 0;
-
-          await userRef.set(
-            {
-              creditsToAdd: currentBalance + amount*4,
-              hasToppedUp: true,
-              lastTopUpAt: new Date().toISOString(),
-            },
-            { merge: true },
-          );
-
-          console.log(`✅ Top-up: $${amount} added to user ${userId}`);
-        } catch (err) {
-          console.error("🔥 Error updating balance:", err.message);
-        }
-      }
-
-        if (!userId) return res.json({ received: true });
-        const sub = session.subscription
-          ? await stripe.subscriptions.retrieve(session.subscription, { expand: ['items.data.price'] })
-          : null;
-
-        if (sub) {
-          await writeBillingFromSubscription(userId, sub, { sessionPaymentStatus: session.payment_status || null });
-        }
-
-        // Do NOT update balance here; wait for invoice.payment_succeeded
-        return res.json({ received: true });
-      }
-
-      // Keep plan/status fresh on changes
-      case 'customer.subscription.created':
-      case 'customer.subscription.updated': {
-        const sub = event.data.object;
-        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
-        const userId = sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
-
-        if (!userId) return res.json({ received: true });
-        await writeBillingFromSubscription(userId, sub);
-        return res.json({ received: true });
-      }
-
-      // Cancel/downgrade
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object;
-        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
-        const userId = sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
-
-        if (!userId) return res.json({ received: true });
-
-        await patchUser(userId, {
-          plan_lookup_key: null,
-          plan: null,
-          currentPlan: null, // clear plain name
-          entitlements: { agents: 0, monthlyCreditsIncluded: 0, addonSeatQty: 0 },
-          billing: {
-            status: sub.status || 'canceled',
-            lastPaymentStatus: 'unpaid',
-            stripeCustomerId: custId || null,
-            stripeSubId: sub.id,
-            currentPeriodEnd: sub.current_period_end ?? null,
-            cancelAtPeriodEnd: !!sub.cancel_at_period_end,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        });
-
-        return res.json({ received: true });
-      }
-
-      // Money actually captured => update balance & mark paid
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object;
-        
-
-        const sub = await stripe.subscriptions.retrieve(invoice.parent.subscription_details.subscription, { expand: ['items.data.price'] });
-        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
-        const userId = sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
-        if (!userId) return res.json({ received: true });
-console.log("ee",sub.items.data[0].price.lookup_key);
-const key=sub.items.data[0].price.lookup_key;
- const amountUsd =( (sub.items.data[0].plan.amount || 0) / 100)*4;
-
-const agentdata =requirePlanInfo(key)
-console.log(agentdata);
-
-        // Refresh billing status
-        await patchUser(userId, {
-          entitlements:agentdata,
-          plan:sub.items.data[0].plan,
-          price:sub.items.data[0].price,
-          ProductName:sub.items.data[0].price.product.name,
-          plan_lookup_key: sub.items.data[0].price.lookup_key || null,
-          billing: {
-            status: sub.status,
-            lastPaymentStatus: 'paid',
-            stripeCustomerId: custId || null,
-            stripeSubId: sub.id,
-            currentPeriodEnd: sub.current_period_end ?? null,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          billingMeta: {
-            lastInvoiceId: invoice.id,
-            lastInvoiceAmountPaid: invoice.amount_paid ?? 0,
-            lastInvoiceCurrency: invoice.currency ?? null,
-          },
-        });
+// Redundant endpoints removed
 
 
-        // ✅ Simple wallet balance increment (USD)
-       
- const tt=       await db.collection('users').doc(userId).set({
-          creditsToAdd: admin.firestore.FieldValue.increment(amountUsd),
-          balanceUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        console.log("rr",tt);
-        
+// Redundant webhook header removed
 
-        return res.json({ received: true });
-      }
+// Redundant webhook logic removed
 
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object;
-        if (!invoice.subscription) return res.json({ received: true });
-
-        const sub = await stripe.subscriptions.retrieve(invoice.subscription);
-        const custId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
-        const userId = sub.metadata?.user_id || (await findUserIdByCustomerId(custId)) || null;
-        if (!userId) return res.json({ received: true });
-
-        await patchUser(userId, {
-          billing: {
-            status: sub.status, // e.g., 'past_due'
-            lastPaymentStatus: 'unpaid',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        });
-
-        return res.json({ received: true });
-      }
-
-      // Optional async flows (e.g., iDEAL)
-      case 'checkout.session.async_payment_succeeded':
-      case 'checkout.session.async_payment_failed': {
-        return res.json({ received: true });
-      }
-
-      default:
-        // Handle other events or ignore
-        return res.json({ received: true });
-    }
-  } catch (err) {
-    console.error('Webhook handler error:', err);
-    // While debugging, still 200 to avoid retry storms
-    return res.status(200).json({ received: true, note: 'handled with errors' });
-  }
-});
 
 // ---------- Normal middleware (after webhook) ----------
 app.use(express.json());
 
 
-app.post('/billing/checkout',verifyFirebaseToken, async (req, res) => {
-  const user_id= req.uid
+app.post('/billing/checkout', verifyFirebaseToken, async (req, res) => {
+  const user_id = req.uid
   try {
-    const { product_id,  email, lookup_key, lookupKey, intent = 'update', when = 'now' } = req.body || {};
+    const { product_id, email, lookup_key, lookupKey, intent = 'update', when = 'now' } = req.body || {};
 
     // --- resolve target price ---
     const targetLookup = lookup_key || lookupKey || null;
@@ -471,10 +446,10 @@ app.post('/billing/checkout',verifyFirebaseToken, async (req, res) => {
       customerId = existing.data[0]?.id || (await stripe.customers.create({ email, metadata: { user_id: user_id || '' } })).id;
     }
     if (!customerId) return res.status(400).json({ error: 'customer_not_found', message: 'Provide email or known customer id.' });
-console.log(customerId);
-  await patchUser(user_id, {
-         stripeCustomerId: customerId
-      });
+    console.log(customerId);
+    await patchUser(user_id, {
+      stripeCustomerId: customerId
+    });
 
     // --- fetch subscriptions (read-only) ---
     const subsList = await stripe.subscriptions.list({
@@ -487,8 +462,8 @@ console.log(customerId);
     // choose primary subscription: prefer active/trialing; otherwise most recent
     const ACTIVE = new Set(['active', 'trialing', 'past_due', 'unpaid']);
     const activeLike = subsList.data.filter(s => ACTIVE.has(s.status));
-    const primary = activeLike.sort((a,b) => b.created - a.created)[0] ||
-                    subsList.data.sort((a,b) => b.created - a.created)[0] || null;
+    const primary = activeLike.sort((a, b) => b.created - a.created)[0] ||
+      subsList.data.sort((a, b) => b.created - a.created)[0] || null;
 
     // ====== CASE 1: no subscription yet -> create Checkout Session ======
     if (!primary) {
@@ -526,8 +501,8 @@ console.log(customerId);
     // convenience: the first item is your base plan if you only sell 1 base line
     const currentItem = primary.items.data[0];
     const currentPriceId = currentItem.price.id;
-console.log("currentPriceId",currentPriceId);
-console.log(priceId);
+    console.log("currentPriceId", currentPriceId);
+    console.log(priceId);
 
 
     // handle intents
@@ -613,16 +588,16 @@ console.log(priceId);
       // { idempotencyKey: `upgrade:${user_id}:${priceId}:${Date.now()}` }
     );
     // console.log("updated",updated.items);
-    
-console.log(updated.items.data[0].price.product.name,);
- const amountUsd =( (updated.items.data[0].plan.amount || 0) / 100)*4;
-console.log("tt",updated.items.data[0].price.lookup_key );
 
-  const ttt=  await patchUser(user_id, {
+    console.log(updated.items.data[0].price.product.name,);
+    const amountUsd = ((updated.items.data[0].plan.amount || 0) / 100) * 4;
+    console.log("tt", updated.items.data[0].price.lookup_key);
+
+    const ttt = await patchUser(user_id, {
       plan_lookup_key: updated.items.data[0].price.lookup_key || null,
-      plan:updated.items.data[0].plan,
-      price:updated.items.data[0].price,
-       ProductName:updated.items.data[0].price.product,
+      plan: updated.items.data[0].plan,
+      price: updated.items.data[0].price,
+      ProductName: updated.items.data[0].price.product,
 
       billing: {
         status: updated.status,
@@ -704,22 +679,22 @@ app.get('/billing/verify', async (req, res) => {
     const session = await stripe.checkout.sessions.retrieve(session_id, { expand: ['subscription'] });
     const userId = session.metadata?.user_id || null;
     const sub = session.subscription || null;
-   // console.log("tt",sub);
+    // console.log("tt",sub);
 
-     const userRef = db.collection("users").doc(userId);
-          const userDoc = await userRef.get();
-          const currentBalance = userDoc.exists
-            ? userDoc.data().balance || 0
-            : 0;
-    
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+    const currentBalance = userDoc.exists
+      ? userDoc.data().balance || 0
+      : 0;
+
     //console.log(session);
     // console.log("RR",session?.plan);
-    
-    
+
+
     if (userId) {
       await patchUser(userId, {
         //  balance: currentBalance + sub?.plan?.amount_decimal/100 || 0,
-        plain:sub?.plan,
+        plain: sub?.plan,
         billing: {
           status: sub ? sub.status : (session.payment_status === 'paid' ? 'active' : 'pending'),
           lastPaymentStatus: session.payment_status, // 'paid' | 'unpaid' | 'no_payment_required'
@@ -744,7 +719,7 @@ app.get('/billing/verify', async (req, res) => {
 
 
 app.get("/billing/status", async (req, res) => {
-  const { userId, expand="stripe" } = req.query;
+  const { userId, expand = "stripe" } = req.query;
   if (!userId) return res.status(400).json({ error: "Missing userId" });
 
   try {
@@ -752,31 +727,31 @@ app.get("/billing/status", async (req, res) => {
     if (!snap.exists) return res.status(404).json({ error: "User not found" });
 
     const u = snap.data() || {};
-// console.log(u);
-const TotalCredit= u.creditsToAdd 
-    const totalused= u.usage 
+    // console.log(u);
+    const TotalCredit = u.creditsToAdd
+    const totalused = u.usage
     const payload = {
       userId: snap.id,
-      credits: typeof u.credits === "number" ? u.creditsToAdd: 0,
-      plan_lookup_key:u.plan_lookup_key,
-      entitlements:u.entitlements || { agents: 0, monthlyCreditsIncluded: 0, addonSeatQty: 0 },
-      TotalCredit: u.creditsToAdd ,
-     totalused: u.usage || 0,
-      balance: TotalCredit- totalused/100 || 0,
+      credits: typeof u.credits === "number" ? u.creditsToAdd : 0,
+      plan_lookup_key: u.plan_lookup_key,
+      entitlements: u.entitlements || { agents: 0, monthlyCreditsIncluded: 0, addonSeatQty: 0 },
+      TotalCredit: u.creditsToAdd,
+      totalused: u.usage || 0,
+      balance: TotalCredit - totalused / 100 || 0,
 
 
 
 
-       
+
     };
 
 
-const sub = await stripe.subscriptions.retrieve( u.billing.stripeSubscriptionId, {
-  expand: ["items.data.price.product"],
-});
-//  console.log(sub.items.data[0]);
- 
-    return res.json({data:payload,data1:sub});
+    const sub = await stripe.subscriptions.retrieve(u.billing.stripeSubscriptionId, {
+      expand: ["items.data.price.product"],
+    });
+    //  console.log(sub.items.data[0]);
+
+    return res.json({ data: payload, data1: sub });
   } catch (e) {
     console.error("GET /billing/status error:", e);
     return res.status(500).json({ error: "Failed to load billing status" });
@@ -792,7 +767,7 @@ app.post("/api/meta/events", async (req, res) => {
   const payload = {
     data: [{
       event_name,
-      event_time: Math.floor(Date.now()/1000),
+      event_time: Math.floor(Date.now() / 1000),
       event_id,                      // use the same ID as browser eventID if you dedup
       action_source: "website",
       event_source_url,
@@ -810,15 +785,15 @@ app.post("/api/meta/events", async (req, res) => {
 
   const url = `https://graph.facebook.com/v20.0/${process.env.META_DATASET_ID}/events?access_token=${process.env.META_ACCESS_TOKEN}`;
   const r = await fetch(url, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
   const json = await r.json();
   res.status(r.ok ? 200 : 400).json(json);
 });
 
- 
+
 
 app.post(
   "/payment/stripe-webhook-invoice-success",
@@ -851,7 +826,7 @@ app.post(
 
           await userRef.set(
             {
-              creditsToAdd: currentBalance + amount*4,
+              creditsToAdd: currentBalance + amount * 4,
               hasToppedUp: true,
               lastTopUpAt: new Date().toISOString(),
             },
@@ -963,7 +938,7 @@ app.ws("/media-stream", (ws, req) => {
 // BILLING_MODE: 'provider' | 'flat' (default 'provider' if unset)
 // Per-user override: user.pricingMode: 'provider' | 'flat'
 const DEFAULT_USD_PER_SECOND = parseFloat(process.env.CALL_USD_PER_SECOND || "0.10"); // 10¢/sec
-const MIN_BILLABLE_SECONDS   = parseInt(process.env.CALL_MIN_BILLABLE_SECONDS || "0", 10);
+const MIN_BILLABLE_SECONDS = parseInt(process.env.CALL_MIN_BILLABLE_SECONDS || "0", 10);
 
 const LIVE_NUMBER = (n) => (typeof n === "number" && isFinite(n) ? n : 0);
 const roundUSD = (n) => Math.round(n * 100) / 100;
@@ -993,7 +968,7 @@ function calcProviderFirst(postCallData, userData) {
   const secs = LIVE_NUMBER(postCallData?.metadata?.call_duration_secs);
   const providerTotal =
     (typeof postCallData?.metadata?.cost_usd === "number" && postCallData.metadata.cost_usd) ??
-    (typeof postCallData?.metadata?.cost     === "number" && postCallData.metadata.cost) ??
+    (typeof postCallData?.metadata?.cost === "number" && postCallData.metadata.cost) ??
     null;
 
   if (providerTotal != null && secs > 0) {
@@ -1052,7 +1027,7 @@ const secret = process.env.ELEVEN_LABS_WEBHOOK_SECRET;
 // Webhook testing endpoint
 app.all("/webhook", async (req, res) => {
 
-  
+
 
   const headers = req.headers["elevenlabs-signature"].split(",");
   const timestamp = headers.find((e) => e.startsWith("t=")).substring(2);
@@ -1072,8 +1047,8 @@ app.all("/webhook", async (req, res) => {
   const webhookUrl =
     agentData?.platform_settings?.workspace_overrides
       ?.conversation_initiation_client_data_webhook?.url;
-console.log("webhookUrl",webhookUrl);
-console.log(agentData?.platform_settings);
+  console.log("webhookUrl", webhookUrl);
+  console.log(agentData?.platform_settings);
 
 
   if (webhookUrl) {
@@ -1138,12 +1113,12 @@ console.log(agentData?.platform_settings);
   } else {
     console.log("Webhook URL is not available");
   }
- 
 
- 
 
- 
-  
+
+
+
+
 
   // Save conversation data to Firebase
   try {
@@ -1193,7 +1168,7 @@ console.log(agentData?.platform_settings);
     // Get user data to fetch callCostPerSecond
     const userDoc = await db.collection("users").doc(userId).get();
     const userData = userDoc.data();
-    const callCostPerSecond =   userData?.callCostPerSecond || 20;
+    const callCostPerSecond = userData?.callCostPerSecond || 20;
 
     // Calculate convCost based on user's callCostPerSecond and call duration
     let convCost;
@@ -1203,16 +1178,16 @@ console.log(agentData?.platform_settings);
       // Fallback to payload cost if callCostPerSecond is not available or 0
       convCost = postCallData.metadata?.cost || 0;
     }
-    let callCost=0;
-    const callCredit=secondsToMinutesUpper(callDurationSecs);
-   callCost=callCredit*callCostPerSecond;
-    console.log({ convCost, callCostPerSecond, callDurationSecs,callCost });
+    let callCost = 0;
+    const callCredit = secondsToMinutesUpper(callDurationSecs);
+    callCost = callCredit * callCostPerSecond;
+    console.log({ convCost, callCostPerSecond, callDurationSecs, callCost });
 
-        // await db.collection('users').doc(userId).set({
-        //   creditsToAdd: admin.firestore.FieldValue.increment(amountUsd),
-        //   balanceUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        // }, { merge: true });
-        // console.log("rr",tt);
+    // await db.collection('users').doc(userId).set({
+    //   creditsToAdd: admin.firestore.FieldValue.increment(amountUsd),
+    //   balanceUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    // }, { merge: true });
+    // console.log("rr",tt);
 
     // Save conversation to conv_history collection
     const convHistoryRef = db
@@ -1223,9 +1198,9 @@ console.log(agentData?.platform_settings);
 
     // await convHistoryRef.set(postCallData);
     await convHistoryRef.set(
-  { ...postCallData, callCost:callCost},
-  { merge: true }
-);
+      { ...postCallData, callCost: callCost },
+      { merge: true }
+    );
     console.log(
       `Conversation ID '${convId}' has been saved to 'conv_history'.`,
     );
@@ -1258,17 +1233,17 @@ console.log(agentData?.platform_settings);
     const updatedInvoice = await invoiceRef.get();
     const invoiceData = updatedInvoice.data();
     const updatedTotalCost = invoiceData?.totalCost || 0;
-console.log("updatedTotalCost",updatedTotalCost);
+    console.log("updatedTotalCost", updatedTotalCost);
 
     const userRef = db.collection("users").doc(userId);
     await userRef.set(
       {
         //  usage: 6000,
         totalcall: admin.firestore.FieldValue.increment(1),
-        LastCalluse:callCost,
-        totalCall: admin.firestore.FieldValue.increment(1) ,
+        LastCalluse: callCost,
+        totalCall: admin.firestore.FieldValue.increment(1),
         totalusage: admin.firestore.FieldValue.increment(callCost),
-        usage: updatedTotalCost ,
+        usage: updatedTotalCost,
         lastCallAt: new Date().toISOString(),
       },
       { merge: true },

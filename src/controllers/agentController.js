@@ -104,10 +104,32 @@ export const agentController = {
       }
 
       // Update agent in Eleven Labs
+      const configToSend = conversation_config || {};
+      if (configToSend.agent) {
+        // Clean up built_in_tools - remove null values
+        if (
+          configToSend.agent.prompt &&
+          configToSend.agent.prompt.built_in_tools
+        ) {
+          configToSend.agent.prompt.built_in_tools = Object.fromEntries(
+            Object.entries(configToSend.agent.prompt.built_in_tools).filter(
+              ([_, value]) => value !== null
+            )
+          );
+        }
+
+        // Handle additional_languages - logic from reference
+        if (configToSend.agent.additional_languages) {
+          if (!Array.isArray(configToSend.agent.additional_languages) || configToSend.agent.additional_languages.length === 0) {
+            delete configToSend.agent.additional_languages;
+          }
+        }
+      }
+
       const updatedAgent = await elevenLabsService.updateAgent(
         agent_id,
         name,
-        conversation_config || {},
+        configToSend,
         platform_settings
       );
 
