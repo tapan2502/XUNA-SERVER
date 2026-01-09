@@ -140,19 +140,20 @@ export const paymentController = {
 
   setupSubscriptionPaymentMethod: async (req, res) => {
     const userId = req.uid;
-    const { email, customerId, return_url } = req.body;
-    try {
+    let { email, customerId, return_url } = req.body;
+
+    const performSetup = async (custId) => {
       const setupIntent = await stripe.setupIntents.create({
-        customer: customerId,
+        customer: custId,
         payment_method_types: ["card"],
         usage: "off_session",
       });
 
       const session = await stripe.checkout.sessions.create({
         mode: "setup",
-        customer: customerId,
+        customer: custId,
         payment_method_types: ["card"],
-        success_url: `${return_url}?setup_success=true&customer_id=${customerId}`,
+        success_url: `${return_url}?setup_success=true&customer_id=${custId}`,
         cancel_url: `${return_url}?setup_canceled=true`,
 
         metadata: {
@@ -161,13 +162,46 @@ export const paymentController = {
           intent: "payment_method_setup",
         },
       });
+      return { session, setupIntent };
+    };
 
-      res.json({
-        success: true,
-        sessionUrl: session.url,
-        sessionId: session.id,
-        setupIntentClientSecret: setupIntent.client_secret,
-      });
+    try {
+      try {
+        const result = await performSetup(customerId);
+        res.json({
+          success: true,
+          sessionUrl: result.session.url,
+          sessionId: result.session.id,
+          setupIntentClientSecret: result.setupIntent.client_secret,
+        });
+      } catch (error) {
+        // Auto-fix: Customer missing in Stripe (e.g. env switch)
+        if (error.code === 'resource_missing' && error.param === 'customer') {
+          console.warn(`[Payment] Customer ${customerId} missing in Stripe. Recreating...`);
+
+          const newCustomer = await stripe.customers.create({
+            email,
+            metadata: { userId }
+          });
+          customerId = newCustomer.id;
+
+          // Update DB - Handle both root and nested billing fields
+          await db.collection("users").doc(userId).set({
+            stripeCustomerId: customerId,
+            billing: { stripeCustomerId: customerId }
+          }, { merge: true });
+
+          // Retry with new ID
+          const result = await performSetup(customerId);
+          return res.json({
+            success: true,
+            sessionUrl: result.session.url,
+            sessionId: result.session.id,
+            setupIntentClientSecret: result.setupIntent.client_secret,
+          });
+        }
+        throw error;
+      }
     } catch (error) {
       console.error("Payment method setup error:", error);
       res.status(500).json({
@@ -259,36 +293,62 @@ export const paymentController = {
   createTopupSession: async (req, res) => {
     try {
       const userId = req.uid;
-      const { email, customerId, amount, return_url } = req.body;
+      let { email, customerId, amount, return_url } = req.body;
 
       if (!email || !customerId || !amount) {
         return res.status(400).json({ error: "Missing parameters" });
       }
 
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        customer: customerId,
-        payment_method_types: ["card"],
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              product_data: {
-                name: `Top-up Credit ($${amount})`,
+      const performTopup = async (custId) => {
+        return await stripe.checkout.sessions.create({
+          mode: "payment",
+          customer: custId,
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: `Top-up Credit ($${amount})`,
+                },
+                unit_amount: amount * 100,
               },
-              unit_amount: amount * 100,
+              quantity: 1,
             },
-            quantity: 1,
+          ],
+          success_url: return_url,
+          cancel_url: return_url,
+          metadata: {
+            userId,
+            type: "topup",
           },
-        ],
-        success_url: return_url,
-        cancel_url: return_url,
-        metadata: {
-          userId,
-          type: "topup",
-        },
-      });
-      return res.json({ sessionUrl: session.url, sessionId: session.id });
+        });
+      };
+
+      try {
+        const session = await performTopup(customerId);
+        return res.json({ sessionUrl: session.url, sessionId: session.id });
+      } catch (error) {
+        // Auto-fix: Customer missing in Stripe
+        if (error.code === 'resource_missing' && error.param === 'customer') {
+          console.warn(`[TopUp] Customer ${customerId} missing in Stripe. Recreating...`);
+
+          const newCustomer = await stripe.customers.create({
+            email,
+            metadata: { userId }
+          });
+          customerId = newCustomer.id;
+
+          await db.collection("users").doc(userId).set({
+            stripeCustomerId: customerId,
+            billing: { stripeCustomerId: customerId }
+          }, { merge: true });
+
+          const session = await performTopup(customerId);
+          return res.json({ sessionUrl: session.url, sessionId: session.id });
+        }
+        throw error;
+      }
     } catch (err) {
       console.error("Error creating top-up session:", err);
       return res.status(500).json({ error: "Failed to create top-up session" });
