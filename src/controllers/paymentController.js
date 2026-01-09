@@ -263,6 +263,17 @@ export const paymentController = {
         })),
       });
     } catch (error) {
+      // Auto-fix: Customer missing in Stripe, return empty setup state
+      if (error.code === 'resource_missing' && error.param === 'customer') {
+        console.warn(`[Payment] checkPaymentMethodSetup: Customer ${customerId} missing in Stripe.`);
+        return res.json({
+          success: true,
+          hasValidPaymentMethod: false,
+          hasDynamicPaymentSetup: false,
+          defaultPaymentMethod: null,
+          paymentMethods: []
+        });
+      }
       console.error("Payment method check error:", error);
       res.status(500).json({
         success: false,
