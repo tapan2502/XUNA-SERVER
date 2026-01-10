@@ -221,11 +221,6 @@ export const phoneNumberController = {
 
   async listPhoneNumbers(req, res) {
     try {
-      const { error, value } = listPhoneNumbersSchema.validate(req.params);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
-      }
-
       const user_id = req.uid;
 
       // Get user's phone numbers from Firebase
@@ -238,8 +233,7 @@ export const phoneNumberController = {
       const userPhoneNumbers = userData.phoneNumbers || [];
 
       // Get all phone numbers from Eleven Labs
-      const allPhoneNumbers =
-        await elevenLabsPhoneNumberService.listPhoneNumbers();
+      const allPhoneNumbers = await elevenLabsPhoneNumberService.listPhoneNumbers();
 
       // Combine Eleven Labs data with stored Firebase data
       const enrichedPhoneNumbers = allPhoneNumbers.map((phoneNumber) => {

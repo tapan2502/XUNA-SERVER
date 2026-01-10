@@ -16,7 +16,7 @@ export const batchCallController = {
 
       const user_id = req.uid;
       console.log(user_id);
-      
+
       const {
         agent_id,
         agent_phone_number_id,
@@ -99,4 +99,29 @@ export const batchCallController = {
       res.status(500).json({ error: "Failed to get batch call" });
     }
   },
+
+  async listBatchCalls(req, res) {
+    try {
+      const user_id = req.uid;
+
+      // Get user's batch calls from Firebase
+      const userDoc = await db.collection("users").doc(user_id).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const userData = userDoc.data();
+      const userBatchCalls = userData.batch_calls || [];
+
+      // Combine with details from ElevenLabs if needed, or just return from Firebase
+      // For now, returning the stored list which contains basic info
+      res.json({
+        batch_calls: userBatchCalls,
+      });
+    } catch (error) {
+      console.error("Error listing batch calls:", error);
+      res.status(500).json({ error: "Failed to list batch calls" });
+    }
+  },
 };
+

@@ -1,7 +1,7 @@
-
 import { db } from "../config/firebase.js";
 import admin from "firebase-admin";
 import { deleteUserSchema } from "../validators/user.js";
+import { v4 as uuidv4 } from 'uuid';
 
 export const userController = {
   async deleteUser(req, res) {
@@ -26,10 +26,25 @@ export const userController = {
 
       const currentUserData = currentUserDoc.data();
 
-      // Check if the current user has super-admin role
-      if (currentUserData.role !== 'super-admin') {
+      // Check if the current user has permission
+      // ADMIN can delete anyone.
+      // AGENCY can delete if target user was created by them (agencyId === currentUserId).
+      if (currentUserData.role === 'ADMIN') {
+        // Allowed
+      } else if (currentUserData.role === 'AGENCY') {
+        // Fetch target user to check agencyId
+        const targetUserDocForCheck = await db.collection('users').doc(targetUserId).get();
+        if (!targetUserDocForCheck.exists) {
+          return res.status(404).json({ error: 'Target user not found' });
+        }
+        if (targetUserDocForCheck.data().agencyId !== currentUserId) {
+          return res.status(403).json({
+            error: 'Access denied. You can only delete users in your agency.'
+          });
+        }
+      } else {
         return res.status(403).json({
-          error: 'Access denied. Only super-admin users can delete other users.'
+          error: 'Access denied. You do not have permission to delete users.'
         });
       }
 
@@ -165,6 +180,106 @@ export const userController = {
     } catch (error) {
       console.error('Error updating password:', error);
       res.status(500).json({ error: 'Failed to update password', details: error.message });
+    }
+  },
+
+  async createUser(req, res) {
+    try {
+      const { email, password, name, role } = req.body;
+      const currentUser = req.user;
+
+      // 1. Validation
+      if (!email || !password || !role) {
+        return res.status(400).json({ error: 'Email, password, and role are required' });
+      }
+
+      // 2. Permission Check
+      if (currentUser.role === 'AGENCY') {
+        if (role !== 'USER') {
+          return res.status(403).json({ error: 'Agencies can only create USER accounts' });
+        }
+      } else if (currentUser.role !== 'ADMIN') {
+        return res.status(403).json({ error: 'Unauthorized to create users' });
+      }
+
+      // 3. Create Firebase Auth user
+      const userRecord = await admin.auth().createUser({
+        email,
+        password,
+        displayName: name,
+      });
+
+      // 4. Create Firestore User Document
+      const newUserData = {
+        name: name || null,
+        email: email,
+        role: role,
+        agencyId: currentUser.role === 'AGENCY' ? currentUser.uid : (req.body.agencyId || null),
+        workspaceId: uuidv4(), // Create a default workspace for every user
+        isActive: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      await db.collection('users').doc(userRecord.uid).set(newUserData);
+
+      res.status(201).json({
+        success: true,
+        uid: userRecord.uid,
+        message: `User created successfully with role ${role}`
+      });
+
+    } catch (error) {
+      console.error('Error creating user:', error);
+      res.status(500).json({ error: 'Failed to create user', details: error.message });
+    }
+  },
+
+  async listWorkspaces(req, res) {
+    try {
+      const currentUser = req.user;
+      let workspaces = [];
+
+      if (currentUser.role === 'ADMIN') {
+        // Fetch everyone except self (to avoid confusion in switcher)
+        const usersSnapshot = await db.collection('users').get();
+        usersSnapshot.forEach(doc => {
+          const data = doc.data();
+          if (doc.id !== currentUser.uid) {
+            workspaces.push({
+              uid: doc.id,
+              name: data.name || data.email,
+              email: data.email,
+              role: data.role || 'USER',
+              agencyId: data.agencyId || null
+            });
+          }
+        });
+      } else if (currentUser.role === 'AGENCY') {
+        // Agencies see themselves + their managed users
+        const managedUsersSnapshot = await db.collection('users')
+          .where('agencyId', '==', currentUser.uid)
+          .get();
+
+        managedUsersSnapshot.forEach(doc => {
+          const data = doc.data();
+          workspaces.push({
+            uid: doc.id,
+            name: data.name || data.email,
+            email: data.email,
+            role: data.role || 'USER',
+            agencyId: data.agencyId
+          });
+        });
+      }
+
+      // Sort by Name
+      workspaces.sort((a, b) => a.name.localeCompare(b.name));
+
+      res.json({ workspaces });
+    } catch (error) {
+      console.error('Error listing workspaces:', error);
+      res.status(500).json({ error: 'Failed to list workspaces' });
     }
   }
 };

@@ -10,7 +10,7 @@ import {
 import admin from "firebase-admin";
 
 export const knowledgeBaseController = {
-  
+
   async createKnowledgeBase(req, res) {
     const user_id = req.uid;
     try {
@@ -23,7 +23,7 @@ export const knowledgeBaseController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      
+
       const { url } = req.body;
 
       // Validate that either file or URL is provided
@@ -69,29 +69,32 @@ export const knowledgeBaseController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
       const { document_id } = req.params;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if knowledge base belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const knowledgeBaseExists = userData.knowledgeBases?.some(
-        (kb) => kb.document_id === document_id
-      );
-
-      if (!knowledgeBaseExists) {
-        return res.status(404).json({
-          error: "Knowledge base not found or does not belong to user",
-        });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Get knowledge base details from Eleven Labs
-      const knowledgeBaseDetails =
-        await elevenLabsKnowledgeBaseService.getKnowledgeBase(document_id);
+      const knowledgeBaseExists = userData.knowledgeBases?.some((kb) => kb.document_id === document_id);
+      if (!knowledgeBaseExists) {
+        return res.status(404).json({ error: "Knowledge base not found or does not belong to user" });
+      }
+
+      const knowledgeBaseDetails = await elevenLabsKnowledgeBaseService.getKnowledgeBase(document_id);
       res.json(knowledgeBaseDetails);
     } catch (error) {
       console.error("Error getting knowledge base:", error);
@@ -106,35 +109,33 @@ export const knowledgeBaseController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
       const { document_id } = req.params;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if knowledge base belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const knowledgeBaseExists = userData.knowledgeBases?.some(
-        (kb) => kb.document_id === document_id
-      );
-
-      if (!knowledgeBaseExists) {
-        return res.status(404).json({
-          error: "Knowledge base not found or does not belong to user",
-        });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Delete knowledge base from Eleven Labs
-      const response = await elevenLabsKnowledgeBaseService.deleteKnowledgeBase(
-        document_id
-      );
+      const knowledgeBaseExists = userData.knowledgeBases?.some((kb) => kb.document_id === document_id);
+      if (!knowledgeBaseExists) {
+        return res.status(404).json({ error: "Knowledge base not found or does not belong to user" });
+      }
 
-      // Remove knowledge base from user's list
-      const updatedKnowledgeBases = userData.knowledgeBases.filter(
-        (kb) => kb.document_id !== document_id
-      );
+      const response = await elevenLabsKnowledgeBaseService.deleteKnowledgeBase(document_id);
+      const updatedKnowledgeBases = userData.knowledgeBases.filter((kb) => kb.document_id !== document_id);
       await userDoc.ref.update({ knowledgeBases: updatedKnowledgeBases });
 
       res.json(response);
@@ -158,14 +159,13 @@ export const knowledgeBaseController = {
       const user_id = req.uid;
       const { cursor, page_size } = value;
 
-      // Get user's knowledge bases from Firebase
       const userDoc = await db.collection("users").doc(user_id).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const userKnowledgeBases = userData.knowledgeBases || [];
+      const accessibleDocIds = new Set((userData.knowledgeBases || []).map(kb => kb.document_id));
 
       // Get all knowledge bases from Eleven Labs with pagination
       const response = await elevenLabsKnowledgeBaseService.listKnowledgeBases(
@@ -174,12 +174,9 @@ export const knowledgeBaseController = {
       );
       const { documents, has_more, next_cursor } = response;
 
-      // Filter knowledge bases to only include those belonging to the user
-      const userKnowledgeBaseIds = new Set(
-        userKnowledgeBases.map((kb) => kb.document_id)
-      );
+      // Filter knowledge bases
       const filteredDocuments = documents.filter((doc) =>
-        userKnowledgeBaseIds.has(doc.id)
+        accessibleDocIds.has(doc.id)
       );
 
       res.json({
@@ -204,33 +201,32 @@ export const knowledgeBaseController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
       const { document_id, cursor, page_size } = value;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if knowledge base belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const knowledgeBaseExists = userData.knowledgeBases?.some(
-        (kb) => kb.document_id === document_id
-      );
-
-      if (!knowledgeBaseExists) {
-        return res.status(404).json({
-          error: "Knowledge base not found or does not belong to user",
-        });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Get dependent agents from Eleven Labs
-      const response = await elevenLabsKnowledgeBaseService.getDependentAgents(
-        document_id,
-        cursor,
-        page_size
-      );
+      const knowledgeBaseExists = userData.knowledgeBases?.some((kb) => kb.document_id === document_id);
+      if (!knowledgeBaseExists) {
+        return res.status(404).json({ error: "Knowledge base not found or does not belong to user" });
+      }
 
+      const response = await elevenLabsKnowledgeBaseService.getDependentAgents(document_id, cursor, page_size);
       res.json(response);
     } catch (error) {
       console.error("Error getting dependent agents:", error);

@@ -32,30 +32,70 @@ export const verifyFirebaseToken = async (req, res, next) => {
         });
       }
 
-      const impersonateUserId = req.headers['x-impersonate-user'];
-      const isAdmin = await checkIfUserIsAdmin(authenticatedUserId);
+      // Hydrate req.user with Firestore data
+      const userDoc = await db.collection('users').doc(authenticatedUserId).get();
+      const userData = userDoc.exists ? userDoc.data() : { role: 'USER' }; // Default to USER if document doesn't exist yet
 
-      if (isAdmin && impersonateUserId) {
-        // Administration impersonation logic...
+      const impersonateUserId = req.headers['x-impersonate-user'];
+      const isAdmin = userData.role === 'ADMIN';
+      const isAgency = userData.role === 'AGENCY';
+
+      if ((isAdmin || isAgency) && impersonateUserId) {
+        // Impersonation logic for ADMIN and AGENCY
         try {
-          await admin.auth().getUser(impersonateUserId);
-          req.uid = impersonateUserId;
-          req.user = { originalUid: authenticatedUserId, isImpersonated: true };
-          console.log(`[Auth] Admin ${authenticatedUserId} impersonating ${impersonateUserId}`);
+          const targetUserDoc = await db.collection('users').doc(impersonateUserId).get();
+          if (!targetUserDoc.exists) {
+            return res.status(404).json({ error: 'Target user not found' });
+          }
+
+          const targetUserData = targetUserDoc.data();
+
+          // Permission check for AGENCY
+          if (isAgency) {
+            // AGENCY can only impersonate users where agencyId matches their UID
+            if (targetUserData.agencyId !== authenticatedUserId) {
+              console.warn(`[Auth] AGENCY ${authenticatedUserId} attempted to impersonate user ${impersonateUserId} from different agency`);
+              return res.status(403).json({ error: 'Cannot impersonate user from different agency' });
+            }
+          }
+          // ADMIN can impersonate anyone (no additional check needed)
+
+          // Set req.user to the impersonated user
+          req.user = {
+            uid: impersonateUserId,
+            role: targetUserData.role || 'USER',
+            agencyId: targetUserData.agencyId,
+            workspaceId: targetUserData.workspaceId,
+            isActive: targetUserData.isActive !== false,
+            _impersonatedBy: authenticatedUserId, // Track who is impersonating
+            _impersonatorRole: userData.role
+          };
+          console.log(`[Auth] ${userData.role} ${authenticatedUserId} impersonating ${impersonateUserId}`);
         } catch (error) {
-          console.error('[Auth] Impersonation target not found:', impersonateUserId);
-          return res.status(404).json({ error: 'Target user not found' });
+          console.error('[Auth] Impersonation failed:', error.message);
+          return res.status(500).json({ error: 'Impersonation failed' });
         }
       } else {
         // Normal authentication
         req.uid = authenticatedUserId;
-        req.user = { uid: authenticatedUserId, isImpersonated: false };
+        req.user = {
+          ...userData,
+          uid: authenticatedUserId,
+          isImpersonated: false
+        };
+      }
+
+      // Always set req.uid to the active user's UID (normal or impersonated)
+      req.uid = req.user.uid;
+
+      // Check if account is active
+      if (req.user.isActive === false) {
+        return res.status(403).json({ error: 'Account is deactivated' });
       }
 
       next();
     } catch (verifyError) {
       console.error('[Auth] Firebase Token Verification Failed:', verifyError.message);
-      // This is usually where Project ID mismatch errors show up
       return res.status(401).json({
         error: 'Unauthorized: Invalid or expired token',
         details: verifyError.message
@@ -64,16 +104,5 @@ export const verifyFirebaseToken = async (req, res, next) => {
   } catch (error) {
     console.error('[Auth] Internal Middleware Error:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
-  }
-};
-
-
-const checkIfUserIsAdmin = async (uid) => {
-  try {
-    const userDoc = await db.collection('users').doc(uid).get();
-    return userDoc.data()?.role === 'super-admin';
-  } catch (error) {
-    console.error('Error fetching user data:', error);
-    return false;
   }
 };

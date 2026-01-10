@@ -17,13 +17,11 @@ export const toolController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const {  tool_config } = value;
+      const { tool_config } = value;
       const user_id = req.uid;
 
-
       // Create tool in Eleven Labs
-      const elevenLabsTool =
-        await elevenLabsToolService.createTool(tool_config);
+      const elevenLabsTool = await elevenLabsToolService.createTool(tool_config);
 
       // Store tool reference in Firebase
       const userRef = db.collection("users").doc(user_id);
@@ -49,29 +47,19 @@ export const toolController = {
 
   async listTools(req, res) {
     try {
-      const { error, value } = listToolsSchema.validate(req.params);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
-      }
-
-      const user_id  = req.uid;
-
-      // Get user's tools from Firebase
+      const user_id = req.uid;
       const userDoc = await db.collection("users").doc(user_id).get();
+
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const userTools = userData.tools || [];
+      const accessibleToolIds = new Set((userData.tools || []).map(t => t.tool_id));
 
-      // Get all tools from Eleven Labs
       const response = await elevenLabsToolService.listTools();
       const allTools = response.tools || [];
-
-      // Filter tools to only include those belonging to the user
-      const userToolIds = new Set(userTools.map((tool) => tool.tool_id));
-      const filteredTools = allTools.filter((tool) => userToolIds.has(tool.id));
+      const filteredTools = allTools.filter((tool) => accessibleToolIds.has(tool.id));
 
       res.json({ tools: filteredTools });
     } catch (error) {
@@ -87,27 +75,31 @@ export const toolController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const {  tool_id } = value;
-      const user_id = req.uid;
+      const { tool_id } = value;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if tool belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const toolExists = userData.tools?.some(
-        (tool) => tool.tool_id === tool_id,
-      );
-
-      if (!toolExists) {
-        return res
-          .status(404)
-          .json({ error: "Tool not found or does not belong to user" });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Get tool details from Eleven Labs
+      const toolExists = userData.tools?.some((tool) => tool.tool_id === tool_id);
+      if (!toolExists) {
+        return res.status(404).json({ error: "Tool not found or does not belong to user" });
+      }
+
       const toolDetails = await elevenLabsToolService.getTool(tool_id);
       res.json(toolDetails);
     } catch (error) {
@@ -118,39 +110,37 @@ export const toolController = {
 
   async updateTool(req, res) {
     try {
-      const { error, value } = updateToolSchema.validate({
-        ...req.params,
-        ...req.body,
-      });
+      const { error, value } = updateToolSchema.validate({ ...req.params, ...req.body });
       if (error) {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const {  tool_id, tool_config } = value;
-      const user_id = req.uid;
+      const { tool_id, tool_config } = value;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if tool belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && (req.query.ownerUid || req.body.ownerUid)) {
+        targetUid = req.query.ownerUid || req.body.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const toolExists = userData.tools?.some(
-        (tool) => tool.tool_id === tool_id,
-      );
-
-      if (!toolExists) {
-        return res
-          .status(404)
-          .json({ error: "Tool not found or does not belong to user" });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Update tool in Eleven Labs
-      const updatedTool = await elevenLabsToolService.updateTool(
-        tool_id,
-        tool_config,
-      );
+      const toolExists = userData.tools?.some((tool) => tool.tool_id === tool_id);
+      if (!toolExists) {
+        return res.status(404).json({ error: "Tool not found or does not belong to user" });
+      }
+
+      const updatedTool = await elevenLabsToolService.updateTool(tool_id, tool_config);
       res.json(updatedTool);
     } catch (error) {
       console.error("Error updating tool:", error);
@@ -166,32 +156,32 @@ export const toolController = {
       }
 
       const { tool_id } = value;
-      const user_id = req.uid;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if tool belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const toolExists = userData.tools?.some(
-        (tool) => tool.tool_id === tool_id,
-      );
-
-      if (!toolExists) {
-        return res
-          .status(404)
-          .json({ error: "Tool not found or does not belong to user" });
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
       }
 
-      // Delete tool from Eleven Labs
-      await elevenLabsToolService.deleteTool(tool_id);
+      const toolExists = userData.tools?.some((tool) => tool.tool_id === tool_id);
+      if (!toolExists) {
+        return res.status(404).json({ error: "Tool not found or does not belong to user" });
+      }
 
-      // Remove tool from user's tools list
-      const updatedTools = userData.tools.filter(
-        (tool) => tool.tool_id !== tool_id,
-      );
+      await elevenLabsToolService.deleteTool(tool_id);
+      const updatedTools = userData.tools.filter((tool) => tool.tool_id !== tool_id);
       await userDoc.ref.update({ tools: updatedTools });
 
       res.status(204).send();

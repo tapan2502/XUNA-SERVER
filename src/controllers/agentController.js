@@ -84,16 +84,29 @@ export const agentController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
-      const { agent_id, conversation_config, name, platform_settings } = value;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
 
-      // Check if agent belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      // If requester is ADMIN or AGENCY, they might be targeting another user's agent
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && (req.query.ownerUid || req.body.ownerUid)) {
+        targetUid = req.query.ownerUid || req.body.ownerUid;
+      }
+
+      // Check if agent belongs to target user
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
+
+      // Permission check for AGENCY: can only manage self or users they created
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
+      }
+
       const agentExists = userData.agents?.some(
         (agent) => agent.agent_id === agent_id
       );
@@ -147,16 +160,29 @@ export const agentController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
       const { agent_id } = req.params;
 
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
       // Check if agent belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
+
+      // Permission check for AGENCY
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
+      }
+
       const agentExists = userData.agents?.some(
         (agent) => agent.agent_id === agent_id
       );
@@ -188,17 +214,30 @@ export const agentController = {
         return res.status(400).json({ error: error.details[0].message });
       }
 
-      const user_id = req.uid;
+      const currentUser = req.user;
+      let targetUid = currentUser.uid;
       const { agent_id } = req.params;
 
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && req.query.ownerUid) {
+        targetUid = req.query.ownerUid;
+      }
+
       // Check if agent belongs to user
-      const userDoc = await db.collection("users").doc(user_id).get();
+      const userDoc = await db.collection("users").doc(targetUid).get();
 
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
+
+      // Permission check for AGENCY
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
+      }
+
       const agentExists = userData.agents?.some(
         (agent) => agent.agent_id === agent_id
       );
@@ -220,20 +259,33 @@ export const agentController = {
 
   async updateAgentStatus(req, res) {
     try {
-      const user_id = req.uid;
+      const currentUser = req.user;
       const { agent_id } = req.params;
       const { status } = req.body;
+      let targetUid = currentUser.uid;
+
+      if ((currentUser.role === 'ADMIN' || currentUser.role === 'AGENCY') && (req.query.ownerUid || req.body.ownerUid)) {
+        targetUid = req.query.ownerUid || req.body.ownerUid;
+      }
 
       if (!status || !["active", "inactive"].includes(status)) {
         return res.status(400).json({ error: "Invalid status" });
       }
 
-      const userDoc = await db.collection("users").doc(user_id).get();
+      const userDoc = await db.collection("users").doc(targetUid).get();
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
+
+      // Permission check for AGENCY
+      if (currentUser.role === 'AGENCY' && targetUid !== currentUser.uid) {
+        if (userData.agencyId !== currentUser.uid) {
+          return res.status(403).json({ error: "Access denied: User is not in your agency" });
+        }
+      }
+
       const agents = userData.agents || [];
       const agentIndex = agents.findIndex((a) => a.agent_id === agent_id);
 
@@ -254,46 +306,37 @@ export const agentController = {
   async listAgents(req, res) {
     try {
       const user_id = req.uid;
-
-      // 1. Get user agents & usage limits from Firebase
       const userDoc = await db.collection("users").doc(user_id).get();
+
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User not found" });
       }
 
       const userData = userDoc.data();
-      const userAgents = userData.agents || [];
-      const usageLimit = userData.usage_limit || 6000; // Default: 100 minutes (6000 seconds)
+      const agentsToEnrich = (userData.agents || []).map(a => ({
+        ...a,
+        ownerUid: user_id,
+        ownerEmail: userData.email
+      }));
 
-      if (userAgents.length === 0) {
+      if (agentsToEnrich.length === 0) {
         return res.json({ agents: [], has_more: false });
       }
 
-      // 2. Fetch Phone Numbers (for binding info)
-      const phoneNumbersList = await elevenLabsPhoneNumberService.listPhoneNumbers();
+      const usageLimit = 6000; // Default: 100 minutes (6000 seconds)
 
-      // 3. Enrich each agent concurrently
+      // Enrich each agent concurrently
       const enrichedAgents = await Promise.all(
-        userAgents.map(async (ua) => {
+        agentsToEnrich.map(async (ua) => {
           try {
-            // A. Get full details (Model, Language, Phone Numbers)
             const details = await elevenLabsService.getAgent(ua.agent_id);
-
-            // B. Extract phone number from agent details
             const phoneNumber = details.phone_numbers && details.phone_numbers.length > 0
               ? details.phone_numbers[0].phone_number
               : null;
 
-            // C. Calculate Usage from Conversation History
-            const conversationsResponse =
-              await elevenLabsConversationService.listConversations(
-                ua.agent_id
-              );
+            const conversationsResponse = await elevenLabsConversationService.listConversations(ua.agent_id);
             const conversations = conversationsResponse.conversations || [];
-            const totalDurationSecs = conversations.reduce(
-              (sum, conv) => sum + (conv.call_duration_secs || 0),
-              0
-            );
+            const totalDurationSecs = conversations.reduce((sum, conv) => sum + (conv.call_duration_secs || 0), 0);
 
             return {
               ...details,
@@ -304,6 +347,8 @@ export const agentController = {
               language: details.conversation_config?.agent?.language || "en",
               languageName: details.conversation_config?.agent?.language === "en" ? "English" : (details.conversation_config?.agent?.language || "English"),
               modelName: formatModelName(details.conversation_config?.agent?.prompt?.llm),
+              ownerUid: ua.ownerUid,
+              ownerEmail: ua.ownerEmail
             };
           } catch (err) {
             console.error(`Error enriching agent ${ua.agent_id}:`, err.message);
@@ -316,9 +361,7 @@ export const agentController = {
         })
       );
 
-      res.json({
-        agents: enrichedAgents,
-      });
+      res.json({ agents: enrichedAgents });
     } catch (error) {
       console.error("Error listing agents:", error);
       res.status(500).json({ error: "Failed to list agents" });
