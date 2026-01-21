@@ -85,6 +85,8 @@ export const agentController = {
       }
 
       const currentUser = req.user;
+      const { agent_id } = req.params;
+      const { conversation_config, name, platform_settings } = req.body;
       let targetUid = currentUser.uid;
 
       // If requester is ADMIN or AGENCY, they might be targeting another user's agent
